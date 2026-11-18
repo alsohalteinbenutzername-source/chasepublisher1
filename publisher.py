@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -879,6 +880,27 @@ def _publish_snapshot(product: str, scope: str, observed_at: datetime, payload: 
     )
 
 
+def _radar_frame_exists(
+    product: str,
+    site_code: str,
+    observed_at: datetime,
+) -> bool:
+    rows = _request(
+        "GET",
+        "/rest/v1/radar_frames",
+        query={
+            "select": "product",
+            "product": f"eq.{product}",
+            "site_code": f"eq.{site_code}",
+            "observed_at": f"eq.{_iso(observed_at)}",
+            "limit": "1",
+        },
+    )
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise PublisherError("Supabase returned an invalid radar frame lookup.")
+    return bool(rows)
+
+
 def _publish_radar(
     product: str,
     site_code: str,
@@ -1150,6 +1172,12 @@ def publish_reflectivity_and_rain() -> None:
         result.timestamp or result.data_updated_at,
         "reflectivity",
     )
+    if _radar_frame_exists("reflectivity", "", observed_at):
+        LOG.info(
+            "Reflectivity frame at %s is already published; skipping decode.",
+            _iso(observed_at),
+        )
+        return
     contents = _result_bytes(result)
     frame = decode_radar_file(contents, timestamp=observed_at)
     _publish_radar("reflectivity", "", observed_at, contents)
@@ -1196,19 +1224,25 @@ def _fetch_velocity_result(site: Any) -> Any | None:
     return next(iter(request.query()), None)
 
 
-def publish_velocity_and_rotations() -> None:
-    sites = velocity_radar_sites()
-    successful = 0
-    for radar_site in sites:
+def _publish_velocity_site(radar_site: Any) -> tuple[bool, str | None]:
+    site_code = "unknown"
+    try:
         site_code = radar_site.site.value
         result = _fetch_velocity_result(radar_site.site)
         if result is None:
             LOG.warning("No current velocity frame for DWD site %s.", site_code)
-            continue
+            return False, None
         observed_at = _valid_timestamp(
             result.timestamp or result.data_updated_at,
             f"velocity at {site_code}",
         )
+        if _radar_frame_exists("velocity", site_code, observed_at):
+            LOG.info(
+                "Velocity frame for %s at %s is already published; skipping decode.",
+                site_code,
+                _iso(observed_at),
+            )
+            return False, None
         contents = _result_bytes(result)
         frame = decode_radar_file(contents, timestamp=observed_at)
         _publish_radar("velocity", site_code, observed_at, contents)
@@ -1229,13 +1263,38 @@ def publish_velocity_and_rotations() -> None:
                 ]
             },
         )
-        successful += 1
         LOG.info(
             "Published velocity for %s and %d rotation detections.",
             site_code,
             len(detections),
         )
-    LOG.info("Published velocity for %d of %d active Doppler sites.", successful, len(sites))
+        return True, None
+    except Exception:
+        LOG.exception("Publishing velocity for DWD site %s failed.", site_code)
+        return False, site_code
+
+
+def publish_velocity_and_rotations() -> None:
+    sites = velocity_radar_sites()
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        outcomes = list(executor.map(_publish_velocity_site, sites))
+
+    successful = sum(1 for was_published, _ in outcomes if was_published)
+    failed_sites = [
+        site_code
+        for _, site_code in outcomes
+        if site_code is not None
+    ]
+    LOG.info(
+        "Published velocity for %d of %d active Doppler sites.",
+        successful,
+        len(sites),
+    )
+    if failed_sites:
+        raise PublisherError(
+            "Velocity publishing failed for DWD site(s): "
+            + ", ".join(failed_sites)
+        )
 
 
 async def _collect_lightning_for(seconds: float) -> dict[str, Any]:
@@ -1314,6 +1373,7 @@ def main(argv: list[str] | None = None) -> None:
     failures: list[str] = []
     if args.daily_outlook_only:
         tasks = (("daily outlook", publish_daily_outlook),)
+        max_workers = 1
     else:
         tasks = (
             ("radar Storage retention", purge_expired_radar_objects),
@@ -1322,13 +1382,20 @@ def main(argv: list[str] | None = None) -> None:
             ("velocity/rotation", publish_velocity_and_rotations),
             ("lightning", publish_lightning),
         )
+        max_workers = 5
 
-    for name, task in tasks:
-        try:
-            task()
-        except Exception as error:
-            LOG.exception("Publishing %s failed.", name)
-            failures.append(name)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(task): name
+            for name, task in tasks
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                future.result()
+            except Exception:
+                LOG.exception("Publishing %s failed.", name)
+                failures.append(name)
     if failures:
         raise PublisherError("One or more publisher tasks failed: " + ", ".join(failures))
     LOG.info("Publisher run completed.")
