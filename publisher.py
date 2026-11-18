@@ -111,6 +111,7 @@ def _request(
     raw_body: bytes | None = None,
     content_type: str = "application/json",
     extra_headers: dict[str, str] | None = None,
+    timeout_seconds: float = 45.0,
 ) -> Any:
     if not SUPABASE_URL or not SERVICE_KEY:
         raise PublisherError("Supabase publisher credentials are not configured.")
@@ -134,7 +135,7 @@ def _request(
     for attempt in range(4):
         try:
             request = Request(url, data=body, headers=headers, method=method)
-            with urlopen(request, timeout=45) as response:
+            with urlopen(request, timeout=timeout_seconds) as response:
                 contents = response.read()
             if not contents:
                 return None
@@ -150,10 +151,10 @@ def _request(
                     f"Supabase {method} {path} returned HTTP {error.code}: "
                     f"{detail[:500]}"
                 ) from error
-        except URLError as error:
+        except (URLError, TimeoutError, OSError) as error:
             if attempt == 3:
                 raise PublisherError(
-                    f"Could not reach Supabase for {method} {path}: {error.reason}"
+                    f"Supabase {method} {path} request timed out or failed: {error}"
                 ) from error
         time.sleep(2**attempt)
     raise PublisherError(f"Supabase request failed: {method} {path}")
@@ -181,7 +182,13 @@ def _result_bytes(result: Any) -> bytes:
     return contents
 
 
-def _upsert(table: str, conflict: str, rows: list[dict[str, Any]]) -> None:
+def _upsert(
+    table: str,
+    conflict: str,
+    rows: list[dict[str, Any]],
+    *,
+    timeout_seconds: float = 45.0,
+) -> None:
     if not rows:
         return
     _request(
@@ -190,6 +197,7 @@ def _upsert(table: str, conflict: str, rows: list[dict[str, Any]]) -> None:
         query={"on_conflict": conflict},
         payload=rows,
         extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -855,6 +863,7 @@ def publish_daily_outlook() -> None:
 
     LOG.info("Fetching the once-daily ICON-D2 outlook grid for %s.", date_text)
     grid = _fetch_daily_outlook_grid()
+    LOG.info("Saving the %d-point daily outlook grid to Supabase.", len(grid))
     _upsert(
         "daily_outlook_forecasts",
         "forecast_date",
@@ -865,6 +874,7 @@ def publish_daily_outlook() -> None:
                 "grid_payload": grid,
             }
         ],
+        timeout_seconds=180.0,
     )
     LOG.info("Published the daily outlook grid for %s (%d points).", date_text, len(grid))
 
