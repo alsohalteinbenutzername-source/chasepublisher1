@@ -50,6 +50,7 @@ STORAGE_DELETE_BATCH_SIZE = 1000
 OUTLOOK_TIMEZONE = ZoneInfo("Europe/Berlin")
 OUTLOOK_EXTENT = (4.0, 16.0, 47.0, 56.0)
 OUTLOOK_GRID_SPACING = 0.4
+OUTLOOK_GRID_POINT_COUNT = 744
 OUTLOOK_API_URL = "https://api.open-meteo.com/v1/dwd-icon"
 OUTLOOK_HOURLY_FIELDS = (
     "cape,convective_inhibition,surface_pressure,"
@@ -79,6 +80,7 @@ NO_LFC_SENTINEL_M = 6000.0
 OUTLOOK_BATCH_SIZE = 100
 OUTLOOK_RETRY_ATTEMPTS = 4
 OUTLOOK_FETCH_WINDOW_SECONDS = 120.0
+OUTLOOK_PUBLISH_BATCH_SIZE = 25
 
 
 class PublisherError(RuntimeError):
@@ -111,7 +113,6 @@ def _request(
     raw_body: bytes | None = None,
     content_type: str = "application/json",
     extra_headers: dict[str, str] | None = None,
-    timeout_seconds: float = 45.0,
 ) -> Any:
     if not SUPABASE_URL or not SERVICE_KEY:
         raise PublisherError("Supabase publisher credentials are not configured.")
@@ -135,7 +136,7 @@ def _request(
     for attempt in range(4):
         try:
             request = Request(url, data=body, headers=headers, method=method)
-            with urlopen(request, timeout=timeout_seconds) as response:
+            with urlopen(request, timeout=45) as response:
                 contents = response.read()
             if not contents:
                 return None
@@ -186,8 +187,6 @@ def _upsert(
     table: str,
     conflict: str,
     rows: list[dict[str, Any]],
-    *,
-    timeout_seconds: float = 45.0,
 ) -> None:
     if not rows:
         return
@@ -197,7 +196,6 @@ def _upsert(
         query={"on_conflict": conflict},
         payload=rows,
         extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-        timeout_seconds=timeout_seconds,
     )
 
 
@@ -675,13 +673,16 @@ def _outlook_grid_points() -> list[tuple[float, float]]:
     latitudes = _outlook_axis_points(south, north)
     longitudes = _outlook_axis_points(west, east)
     points = [(latitude, longitude) for latitude in latitudes for longitude in longitudes]
-    if len(points) != 744:
-        raise PublisherError(f"Outlook grid must contain 744 points, got {len(points)}.")
+    if len(points) != OUTLOOK_GRID_POINT_COUNT:
+        raise PublisherError(
+            "Outlook grid must contain "
+            f"{OUTLOOK_GRID_POINT_COUNT} points, got {len(points)}."
+        )
     return points
 
 
 def _valid_outlook_grid(grid: Any) -> bool:
-    if not isinstance(grid, list) or len(grid) != 744:
+    if not isinstance(grid, list) or len(grid) != OUTLOOK_GRID_POINT_COUNT:
         return False
     for point in grid:
         if not isinstance(point, dict):
@@ -844,38 +845,77 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
 def publish_daily_outlook() -> None:
     forecast_date = datetime.now(OUTLOOK_TIMEZONE).date()
     date_text = forecast_date.isoformat()
-    rows = _request(
+    existing_points = _request(
         "GET",
-        "/rest/v1/daily_outlook_forecasts",
+        "/rest/v1/daily_outlook_forecast_points",
         query={
-            "select": "forecast_date,grid_payload",
+            "select": "point_index",
             "forecast_date": f"eq.{date_text}",
-            "limit": "1",
+            "order": "point_index.asc",
+            "limit": str(OUTLOOK_GRID_POINT_COUNT),
         },
     )
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        raise PublisherError("Supabase returned an invalid daily outlook response.")
-    if rows and rows[0].get("forecast_date") == date_text:
-        if _valid_outlook_grid(rows[0].get("grid_payload")):
-            LOG.info("Daily outlook for %s is already published; skipping Open-Meteo.", date_text)
-            return
-        LOG.warning("Stored daily outlook for %s is incomplete; refreshing it.", date_text)
+    if not isinstance(existing_points, list) or not all(
+        isinstance(row, dict) for row in existing_points
+    ):
+        raise PublisherError("Supabase returned an invalid daily outlook point response.")
+    if [row.get("point_index") for row in existing_points] == list(
+        range(OUTLOOK_GRID_POINT_COUNT)
+    ):
+        LOG.info("Daily outlook for %s is already published; skipping Open-Meteo.", date_text)
+        return
+    if existing_points:
+        LOG.warning(
+            "Stored daily outlook for %s has %d/%d points; refreshing it.",
+            date_text,
+            len(existing_points),
+            OUTLOOK_GRID_POINT_COUNT,
+        )
 
     LOG.info("Fetching the once-daily ICON-D2 outlook grid for %s.", date_text)
     grid = _fetch_daily_outlook_grid()
-    LOG.info("Saving the %d-point daily outlook grid to Supabase.", len(grid))
+    issued_at = _iso(datetime.now(timezone.utc))
     _upsert(
         "daily_outlook_forecasts",
         "forecast_date",
         [
             {
                 "forecast_date": date_text,
-                "issued_at": _iso(datetime.now(timezone.utc)),
-                "grid_payload": grid,
+                "issued_at": issued_at,
+                "grid_payload": [],
             }
         ],
-        timeout_seconds=180.0,
     )
+    batch_count = (
+        len(grid) + OUTLOOK_PUBLISH_BATCH_SIZE - 1
+    ) // OUTLOOK_PUBLISH_BATCH_SIZE
+    LOG.info(
+        "Saving the %d-point daily outlook grid in %d Supabase batches.",
+        len(grid),
+        batch_count,
+    )
+    for batch_start in range(0, len(grid), OUTLOOK_PUBLISH_BATCH_SIZE):
+        batch_end = min(batch_start + OUTLOOK_PUBLISH_BATCH_SIZE, len(grid))
+        rows = [
+            {
+                "forecast_date": date_text,
+                "point_index": point_index,
+                "grid_payload": grid[point_index],
+            }
+            for point_index in range(batch_start, batch_end)
+        ]
+        _upsert(
+            "daily_outlook_forecast_points",
+            "forecast_date,point_index",
+            rows,
+        )
+        LOG.info(
+            "Saved daily outlook point batch %d/%d (%d/%d points).",
+            batch_start // OUTLOOK_PUBLISH_BATCH_SIZE + 1,
+            batch_count,
+            batch_end,
+            len(grid),
+        )
     LOG.info("Published the daily outlook grid for %s (%d points).", date_text, len(grid))
 
 
