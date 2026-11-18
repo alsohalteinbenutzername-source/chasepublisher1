@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -78,8 +77,8 @@ OUTLOOK_PROFILE_FIELDS = (
 )
 NO_LFC_SENTINEL_M = 6000.0
 OUTLOOK_BATCH_SIZE = 100
-OUTLOOK_CALLS_PER_MINUTE = 450
 OUTLOOK_RETRY_ATTEMPTS = 4
+OUTLOOK_FETCH_WINDOW_SECONDS = 120.0
 
 
 class PublisherError(RuntimeError):
@@ -743,15 +742,7 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
         points[index : index + OUTLOOK_BATCH_SIZE]
         for index in range(0, len(points), OUTLOOK_BATCH_SIZE)
     ]
-    calls_per_location = len(OUTLOOK_HOURLY_FIELDS) / 10.0
-    max_batches_per_minute = max(
-        1,
-        int(
-            OUTLOOK_CALLS_PER_MINUTE
-            // (OUTLOOK_BATCH_SIZE * calls_per_location)
-        ),
-    )
-    batch_interval = 60.0 / max_batches_per_minute + 2.0
+    batch_interval = OUTLOOK_FETCH_WINDOW_SECONDS / len(batches)
     started_at = time.monotonic()
     grid: list[dict[str, Any]] = []
 
@@ -761,6 +752,12 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
         if wait_seconds > 0:
             time.sleep(wait_seconds)
 
+        LOG.info(
+            "Fetching daily outlook batch %d/%d (%d locations).",
+            batch_index + 1,
+            len(batches),
+            len(batch),
+        )
         request_params = {
             "latitude": ",".join(f"{latitude:.3f}" for latitude, _ in batch),
             "longitude": ",".join(f"{longitude:.3f}" for _, longitude in batch),
@@ -823,6 +820,13 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
                 for field in OUTLOOK_PROFILE_FIELDS:
                     hourly[field].append(profile_metrics[field])
             grid.append({"icon_d2": hourly})
+        LOG.info(
+            "Fetched daily outlook batch %d/%d (%d/%d points).",
+            batch_index + 1,
+            len(batches),
+            len(grid),
+            len(points),
+        )
 
     if not _valid_outlook_grid(grid):
         raise PublisherError("Open-Meteo returned an incomplete daily outlook grid.")
@@ -878,27 +882,6 @@ def _publish_snapshot(product: str, scope: str, observed_at: datetime, payload: 
             }
         ],
     )
-
-
-def _radar_frame_exists(
-    product: str,
-    site_code: str,
-    observed_at: datetime,
-) -> bool:
-    rows = _request(
-        "GET",
-        "/rest/v1/radar_frames",
-        query={
-            "select": "product",
-            "product": f"eq.{product}",
-            "site_code": f"eq.{site_code}",
-            "observed_at": f"eq.{_iso(observed_at)}",
-            "limit": "1",
-        },
-    )
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        raise PublisherError("Supabase returned an invalid radar frame lookup.")
-    return bool(rows)
 
 
 def _publish_radar(
@@ -1172,12 +1155,6 @@ def publish_reflectivity_and_rain() -> None:
         result.timestamp or result.data_updated_at,
         "reflectivity",
     )
-    if _radar_frame_exists("reflectivity", "", observed_at):
-        LOG.info(
-            "Reflectivity frame at %s is already published; skipping decode.",
-            _iso(observed_at),
-        )
-        return
     contents = _result_bytes(result)
     frame = decode_radar_file(contents, timestamp=observed_at)
     _publish_radar("reflectivity", "", observed_at, contents)
@@ -1224,25 +1201,19 @@ def _fetch_velocity_result(site: Any) -> Any | None:
     return next(iter(request.query()), None)
 
 
-def _publish_velocity_site(radar_site: Any) -> tuple[bool, str | None]:
-    site_code = "unknown"
-    try:
+def publish_velocity_and_rotations() -> None:
+    sites = velocity_radar_sites()
+    successful = 0
+    for radar_site in sites:
         site_code = radar_site.site.value
         result = _fetch_velocity_result(radar_site.site)
         if result is None:
             LOG.warning("No current velocity frame for DWD site %s.", site_code)
-            return False, None
+            continue
         observed_at = _valid_timestamp(
             result.timestamp or result.data_updated_at,
             f"velocity at {site_code}",
         )
-        if _radar_frame_exists("velocity", site_code, observed_at):
-            LOG.info(
-                "Velocity frame for %s at %s is already published; skipping decode.",
-                site_code,
-                _iso(observed_at),
-            )
-            return False, None
         contents = _result_bytes(result)
         frame = decode_radar_file(contents, timestamp=observed_at)
         _publish_radar("velocity", site_code, observed_at, contents)
@@ -1263,38 +1234,13 @@ def _publish_velocity_site(radar_site: Any) -> tuple[bool, str | None]:
                 ]
             },
         )
+        successful += 1
         LOG.info(
             "Published velocity for %s and %d rotation detections.",
             site_code,
             len(detections),
         )
-        return True, None
-    except Exception:
-        LOG.exception("Publishing velocity for DWD site %s failed.", site_code)
-        return False, site_code
-
-
-def publish_velocity_and_rotations() -> None:
-    sites = velocity_radar_sites()
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        outcomes = list(executor.map(_publish_velocity_site, sites))
-
-    successful = sum(1 for was_published, _ in outcomes if was_published)
-    failed_sites = [
-        site_code
-        for _, site_code in outcomes
-        if site_code is not None
-    ]
-    LOG.info(
-        "Published velocity for %d of %d active Doppler sites.",
-        successful,
-        len(sites),
-    )
-    if failed_sites:
-        raise PublisherError(
-            "Velocity publishing failed for DWD site(s): "
-            + ", ".join(failed_sites)
-        )
+    LOG.info("Published velocity for %d of %d active Doppler sites.", successful, len(sites))
 
 
 async def _collect_lightning_for(seconds: float) -> dict[str, Any]:
@@ -1356,7 +1302,7 @@ def main(argv: list[str] | None = None) -> None:
     modes.add_argument(
         "--skip-daily-outlook",
         action="store_true",
-        help="Compatibility option; live publishing already skips the outlook.",
+        help="Publish live data without refreshing the daily outlook.",
     )
     modes.add_argument(
         "--daily-outlook-only",
@@ -1373,7 +1319,6 @@ def main(argv: list[str] | None = None) -> None:
     failures: list[str] = []
     if args.daily_outlook_only:
         tasks = (("daily outlook", publish_daily_outlook),)
-        max_workers = 1
     else:
         tasks = (
             ("radar Storage retention", purge_expired_radar_objects),
@@ -1382,20 +1327,15 @@ def main(argv: list[str] | None = None) -> None:
             ("velocity/rotation", publish_velocity_and_rotations),
             ("lightning", publish_lightning),
         )
-        max_workers = 5
+        if not args.skip_daily_outlook:
+            tasks += (("daily outlook", publish_daily_outlook),)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(task): name
-            for name, task in tasks
-        }
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                future.result()
-            except Exception:
-                LOG.exception("Publishing %s failed.", name)
-                failures.append(name)
+    for name, task in tasks:
+        try:
+            task()
+        except Exception as error:
+            LOG.exception("Publishing %s failed.", name)
+            failures.append(name)
     if failures:
         raise PublisherError("One or more publisher tasks failed: " + ", ".join(failures))
     LOG.info("Publisher run completed.")
