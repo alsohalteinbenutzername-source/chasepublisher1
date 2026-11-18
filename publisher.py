@@ -1297,7 +1297,7 @@ def main(argv: list[str] | None = None) -> None:
     modes.add_argument(
         "--skip-daily-outlook",
         action="store_true",
-        help="Publish live data without refreshing the daily outlook.",
+        help="Compatibility option; live publishing already skips the outlook.",
     )
     modes.add_argument(
         "--daily-outlook-only",
@@ -1322,8 +1322,6 @@ def main(argv: list[str] | None = None) -> None:
             ("velocity/rotation", publish_velocity_and_rotations),
             ("lightning", publish_lightning),
         )
-        if not args.skip_daily_outlook:
-            tasks += (("daily outlook", publish_daily_outlook),)
 
     for name, task in tasks:
         try:
