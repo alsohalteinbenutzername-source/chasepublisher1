@@ -5,10 +5,10 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from publisher.severe_parameters import (
-    calculate_spc_composites,
-    calculate_spc_effective_parameters,
-)
+from severe_parameters import (
+     calculate_spc_composites,
+     calculate_spc_effective_parameters,
+ )
 from stormanalyzer import analyze_snowstorm, analyze_storm
 
 
