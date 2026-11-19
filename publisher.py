@@ -36,7 +36,7 @@ from radar import (
     velocity_radar_sites,
 )
 from tracking import fetch_latest_storm_cells
-from publisher.severe_parameters import PRESSURE_LEVEL_HOURLY_FIELDS
+from severe_parameters import PRESSURE_LEVEL_HOURLY_FIELDS
 
 
 LOG = logging.getLogger("stormchase-publisher")
