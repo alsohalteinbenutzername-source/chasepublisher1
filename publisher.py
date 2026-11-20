@@ -280,7 +280,7 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                         retry_at = retry_at.replace(tzinfo=timezone.utc)
                     delay = min(
                         max((retry_at - datetime.now(timezone.utc)).total_seconds(), 1.0),
-                        3600.0,
+                        60.0,
                     )
                 except (TypeError, ValueError, OverflowError):
                     delay = 5.0 * (2**attempt)
