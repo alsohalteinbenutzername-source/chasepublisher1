@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import math
@@ -16,7 +17,6 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
-from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import websockets
@@ -78,10 +78,11 @@ _OUTLOOK_PROFILE_FIELDS = tuple(
 OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys(
     (*_BASE_OUTLOOK_HOURLY_FIELDS, *_OUTLOOK_PROFILE_FIELDS)
 ))
-OUTLOOK_BATCH_SIZE = 45
-OUTLOOK_RETRY_ATTEMPTS = 4
+OUTLOOK_BATCH_SIZE = 30
+OUTLOOK_RETRY_ATTEMPTS = 3
 OUTLOOK_CALLS_PER_MINUTE = 450.0
-OUTLOOK_FETCH_WINDOW_SECONDS = 120.0
+OUTLOOK_FETCH_WINDOW_SECONDS = 180.0
+MAX_RETRY_SLEEP_SECONDS = 120.0
 OUTLOOK_PUBLISH_BATCH_SIZE = 25
 OUTLOOK_GRID_VERSION = "raw-icon-d2-v2"
 
@@ -272,7 +273,11 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                 ) from error
             retry_after = error.headers.get("Retry-After")
             try:
-                delay = min(max(float(retry_after), 1.0), 3600.0) if retry_after else 5.0 * (2**attempt)
+                delay = (
+                    min(max(float(retry_after), 1.0), MAX_RETRY_SLEEP_SECONDS)
+                    if retry_after
+                    else min(5.0 * (2**attempt), 60.0)
+                )
             except (TypeError, ValueError):
                 try:
                     retry_at = parsedate_to_datetime(retry_after)
@@ -280,10 +285,10 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                         retry_at = retry_at.replace(tzinfo=timezone.utc)
                     delay = min(
                         max((retry_at - datetime.now(timezone.utc)).total_seconds(), 1.0),
-                        60.0,
+                        MAX_RETRY_SLEEP_SECONDS,
                     )
                 except (TypeError, ValueError, OverflowError):
-                    delay = 5.0 * (2**attempt)
+                    delay = min(5.0 * (2**attempt), 60.0)
             LOG.warning(
                 "Open-Meteo returned HTTP %d for an outlook batch on attempt %d/%d; "
                 "retrying in %.1f seconds.",
