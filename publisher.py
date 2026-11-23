@@ -78,11 +78,11 @@ _OUTLOOK_PROFILE_FIELDS = tuple(
 OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys(
     (*_BASE_OUTLOOK_HOURLY_FIELDS, *_OUTLOOK_PROFILE_FIELDS)
 ))
-OUTLOOK_BATCH_SIZE = 55
+OUTLOOK_BATCH_SIZE = 100
 OUTLOOK_RETRY_ATTEMPTS = 3
-OUTLOOK_CALLS_PER_MINUTE = 450.0
-OUTLOOK_FETCH_WINDOW_SECONDS = 180.0
-MAX_RETRY_SLEEP_SECONDS = 120.0
+OUTLOOK_CALLS_PER_MINUTE = 600.0
+OUTLOOK_FETCH_WINDOW_SECONDS = 90.0
+MAX_RETRY_SLEEP_SECONDS = 30.0
 OUTLOOK_PUBLISH_BATCH_SIZE = 25
 OUTLOOK_GRID_VERSION = "raw-icon-d2-v2"
 
@@ -262,7 +262,7 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
     for attempt in range(OUTLOOK_RETRY_ATTEMPTS):
         try:
             request = Request(url, headers={"Accept": "application/json"})
-            with urlopen(request, timeout=60) as response:
+            with urlopen(request, timeout=25) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
@@ -276,7 +276,7 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                 delay = (
                     min(max(float(retry_after), 1.0), MAX_RETRY_SLEEP_SECONDS)
                     if retry_after
-                    else min(5.0 * (2**attempt), 60.0)
+                    else min(5.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
                 )
             except (TypeError, ValueError):
                 try:
@@ -288,7 +288,7 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
                         MAX_RETRY_SLEEP_SECONDS,
                     )
                 except (TypeError, ValueError, OverflowError):
-                    delay = min(5.0 * (2**attempt), 60.0)
+                    delay = min(5.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
             LOG.warning(
                 "Open-Meteo returned HTTP %d for an outlook batch on attempt %d/%d; "
                 "retrying in %.1f seconds.",
@@ -301,7 +301,7 @@ def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any
         except (URLError, TimeoutError, OSError) as error:
             if attempt + 1 >= OUTLOOK_RETRY_ATTEMPTS:
                 raise PublisherError(f"Could not reach Open-Meteo: {error}") from error
-            delay = min(5.0 * (2**attempt), 60.0)
+            delay = min(5.0 * (2**attempt), MAX_RETRY_SLEEP_SECONDS)
             LOG.warning(
                 "Open-Meteo outlook request failed on attempt %d/%d; "
                 "retrying in %.1f seconds: %s",
