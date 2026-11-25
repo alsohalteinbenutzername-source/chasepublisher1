@@ -704,15 +704,11 @@ def publish_general_weather() -> None:
         for index, point in enumerate(payload):
             point_payload = _daily_weather_payload(point, start_index + index)
             latitude, longitude = batch[index]
-            if (
-                point_payload["latitude"] is None
-                or point_payload["longitude"] is None
-                or abs(point_payload["latitude"] - latitude) > 0.01
-                or abs(point_payload["longitude"] - longitude) > 0.01
-            ):
-                raise PublisherError(
-                    "Open-Meteo returned a general-weather point for an unexpected location."
-                )
+            # Open-Meteo reports the selected model grid-cell center, which can
+            # differ from the requested coordinates. Keep the publisher's grid index
+            # aligned by storing the original requested grid location.
+            point_payload["latitude"] = latitude
+            point_payload["longitude"] = longitude
             rows.append(
                 {
                     "forecast_date": date_text,
