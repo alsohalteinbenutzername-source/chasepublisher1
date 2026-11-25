@@ -64,7 +64,7 @@ _BASE_OUTLOOK_HOURLY_FIELDS = (
     "relative_humidity_700hPa,relative_humidity_500hPa,"
     "geopotential_height_925hPa,geopotential_height_850hPa,"
     "geopotential_height_700hPa,geopotential_height_500hPa,"
-    "precipitation,snowfall,wind_speed_10m,wind_direction_10m,"
+    "precipitation,wind_speed_10m,wind_direction_10m,"
     "wind_speed_180m,wind_direction_180m,"
     "wind_speed_925hPa,wind_direction_925hPa,wind_speed_850hPa,"
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
@@ -78,7 +78,7 @@ _OUTLOOK_PROFILE_FIELDS = tuple(
 OUTLOOK_HOURLY_FIELDS = list(dict.fromkeys(
     (*_BASE_OUTLOOK_HOURLY_FIELDS, *_OUTLOOK_PROFILE_FIELDS)
 ))
-OUTLOOK_BATCH_SIZE = 100
+OUTLOOK_BATCH_SIZE = 50
 OUTLOOK_RETRY_ATTEMPTS = 3
 OUTLOOK_CALLS_PER_MINUTE = max(
     600.0, (len(OUTLOOK_HOURLY_FIELDS) / 10.0) * OUTLOOK_BATCH_SIZE
